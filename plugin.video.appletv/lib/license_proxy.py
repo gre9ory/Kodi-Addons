@@ -129,6 +129,39 @@ _DISCOVERED_KEYS = {}
 # clear keys discovered for the previous one -- a live event rotates its keys
 # per play, and a stale one standing in gives -1002/-1004.
 _LAST_MASTER = None
+# The master playlist the add-on already fetched while resolving this play.
+# Apple assembles a fresh reel of promos on every master request, so asking
+# for it twice yields two different streams: the add-on timed the subtitles
+# against one assembly while ISA played another. That put each asset's cues
+# at the wrong moment and showed promo subtitles over a promo that was never
+# served -- measured on 2026-11-04, where the two fetches differed by whole
+# promos (A6812835162 vs A6822429995) and moved the feature by ~0.8s, and by
+# ~30s on another play. Serving ISA the very manifest the subtitles were
+# measured from keeps both describing one stream.
+# It has to travel through a file, not a module-level dict: Kodi runs the
+# plugin in its own process and this proxy in the service process, so nothing
+# set during resolve is in memory here.
+MASTER_CACHE_DOC = "master_cache.m3u8"
+MASTER_CACHE_META = "master_cache.json"
+
+
+def _cached_master(url, max_age=600):
+    """The master the add-on fetched while resolving this play, if it is for
+    this url and still fresh. None otherwise, and the caller then fetches."""
+    import os
+    try:
+        d = kodiutils.profile_dir()
+        with open(os.path.join(d, MASTER_CACHE_META), encoding="utf-8") as fh:
+            meta = json.load(fh)
+        if meta.get("url") != url:
+            return None
+        age = time.time() - (meta.get("stamp") or 0)
+        if not (0 <= age < max_age):
+            return None
+        with open(os.path.join(d, MASTER_CACHE_DOC), encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return None
 # Streaming leases taken this playback: each successful licence request, kept so
 # it can be released on stop. The web client releases a lease by re-sending the
 # very same request with lease-action changed from "start" to "stop" (the
@@ -373,12 +406,16 @@ class _Handler(BaseHTTPRequestHandler):
         ctx = _context()
         is_master = "u=" in parsed.query and parse_qs(parsed.query).get("m", ["0"])[0] == "1"
         is_clear = parse_qs(parsed.query).get("c", ["0"])[0] == "1"
-        # A master for a url not seen before means a new play: drop the keys
-        # discovered for the last one so a live event's rotated keys cannot
-        # linger. The master is served before any variant, so this clears
-        # before this play's keys are collected.
+        # Every master fetch means a new play: drop the keys discovered for
+        # the last one so rotated keys cannot linger. This used to clear only
+        # when the master url differed, which left the previous play's keys in
+        # place when the same title was played again -- harmless while the
+        # up-front keys won, but not now that the served ones do. The master
+        # is served before any variant, so this still clears before this
+        # play's keys are collected, and a live stream that refetches its
+        # master simply repopulates them from the variants that follow.
         global _LAST_MASTER
-        if is_master and target != _LAST_MASTER:
+        if is_master:
             _DISCOVERED_KEYS.clear()
             # A new play: any leases still recorded belong to a stream that was
             # not released (Kodi killed playback without a stop event); drop
@@ -400,14 +437,27 @@ class _Handler(BaseHTTPRequestHandler):
                 headers["media-user-token"] = ctx["media_user_token"]
 
         try:
-            resp = requests.get(target, headers=headers, timeout=30)
-            if resp.status_code != 200:
-                kodiutils.log_error("Manifest proxy %s -> HTTP %s"
-                                    % ("master" if is_master else "variant", resp.status_code))
-                self.send_response(resp.status_code)
-                self.end_headers()
-                return
-            body = self._rewrite(resp.text, target, is_clear).encode("utf-8")
+            source = None
+            if is_master:
+                source = _cached_master(target)
+                if source is not None:
+                    kodiutils.log("Manifest proxy: reusing the master the "
+                                  "add-on resolved with, so the subtitles "
+                                  "describe this very assembly")
+                else:
+                    kodiutils.log("Manifest proxy: no cached master for this "
+                                  "url; Apple will assemble a fresh reel and "
+                                  "the subtitle timings will not fit it")
+            if source is None:
+                resp = requests.get(target, headers=headers, timeout=30)
+                if resp.status_code != 200:
+                    kodiutils.log_error("Manifest proxy %s -> HTTP %s"
+                                        % ("master" if is_master else "variant", resp.status_code))
+                    self.send_response(resp.status_code)
+                    self.end_headers()
+                    return
+                source = resp.text
+            body = self._rewrite(source, target, is_clear).encode("utf-8")
         except Exception as exc:
             kodiutils.log_error("Manifest proxy error: %s" % exc)
             self.send_response(502)
@@ -690,6 +740,23 @@ class _Handler(BaseHTTPRequestHandler):
             _encode_url(urljoin(base_url, url)))
 
     def _add_keyid(self, line):
+        # Normalise the data: URI base64 padding first. Apple omits the
+        # "=" padding and ISA 20.x decodes strictly, which otherwise
+        # fails at a new period with "Incorrect padding characters".
+        _m = re.search(r'URI="([^"]+)"', line)
+        if _m and "base64," in _m.group(1):
+            _uri = _m.group(1)
+            _head, _b64 = _uri.split("base64,", 1)
+            # Apple emits data:text/plain;keyInfo=<blob>;base64,<pssh>.
+            # keyInfo= is not part of the data URI spec and ISA 20.x
+            # mishandles it, reporting "Incorrect padding" from its "=".
+            # Only the PSSH matters to ISA, so drop the extra parameter.
+            _head = re.sub(r";keyInfo=[^;]*", "", _head)
+            _stripped = _b64.strip()
+            _padded = _stripped + "=" * (-len(_stripped) % 4)
+            _new = _head + "base64," + _padded
+            if _new != _uri:
+                line = line.replace(_uri, _new)
         if "KEYID=" in line:
             return line
         m = re.search(r'URI="([^"]+)"', line)
@@ -751,15 +818,20 @@ class _Handler(BaseHTTPRequestHandler):
         # (video and audio have different keys); a wrong or missing uri gives a
         # 500. Match by the key id embedded in the challenge, then fall back to
         # the other known keys rather than failing outright.
-        # Keys found up front for this play, plus any seen while serving its
-        # variants -- but the fresh per-play keys win. A live event reuses a
-        # key id across plays with a different contentId each time, so letting
-        # a discovered key from an earlier play override this play's fresh one
-        # sent a stale uri and earned -1002/-1004. Discovered keys only fill a
-        # gap the up-front collection missed, never replace a fresh key.
+        # Keys found up front for this play, plus the ones actually served to
+        # ISA while playing it. The served ones win -- see below -- which is
+        # safe because the discovered dict is now cleared on every master
+        # fetch, so a key id reused across plays with a different contentId
+        # can no longer let an earlier play's uri stand in for this one's.
         wv_keys = dict(ctx.get("wv_keys") or {})
+        # The key the proxy actually served wins over the one collected up
+        # front. Apple reissues a key's contentId on every master fetch, so
+        # the up-front copy can already be stale by the time ISA asks for a
+        # licence, and a stale uri is exactly what Apple refuses with -1002.
+        # The up-front value is kept and still tried, as a later candidate.
+        _upfront = dict(wv_keys)
         for kid, uri in _DISCOVERED_KEYS.items():
-            wv_keys.setdefault(kid, uri)
+            wv_keys[kid] = uri
 
         candidates = []
         matched_kid = None
@@ -772,6 +844,11 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 continue
         for kuri in wv_keys.values():
+            if kuri not in candidates:
+                candidates.append(kuri)
+        # Try the up-front uris as well, after the served ones, so this change
+        # can only add candidates and never take the old behaviour away.
+        for kuri in _upfront.values():
             if kuri not in candidates:
                 candidates.append(kuri)
         if not candidates:
