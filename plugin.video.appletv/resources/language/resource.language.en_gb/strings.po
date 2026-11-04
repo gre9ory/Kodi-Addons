@@ -134,7 +134,7 @@ msgid "Fetch all subtitle languages (off: only Kodi's language and English)"
 msgstr ""
 
 msgctxt "#32102"
-msgid "Subtitle delay in seconds (blank = 10; adjust if subtitles run early or late)"
+msgid "Subtitle delay: blank = automatic; -1 or +0.5 trims the automatic value; a plain number replaces it"
 msgstr ""
 
 msgctxt "#32103"
