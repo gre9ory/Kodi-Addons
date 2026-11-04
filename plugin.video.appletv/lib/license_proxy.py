@@ -255,7 +255,9 @@ def kid_from_data_uri(uri):
     try:
         if "base64," not in uri:
             return None
-        pssh = base64.b64decode(unquote(uri.split("base64,", 1)[1]))
+        _b = unquote(uri.split("base64,", 1)[1]).strip()
+        _b += "=" * (-len(_b) % 4)   # Apple omits padding
+        pssh = base64.b64decode(_b)
         # WidevinePsshData: key_id is field 2 -> tag 0x12, length 0x10 (16).
         i = pssh.find(b"\x12\x10")
         if i >= 0 and len(pssh) >= i + 18:
